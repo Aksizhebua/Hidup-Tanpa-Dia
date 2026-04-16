@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hidup Tanpa Dia</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600&family=Nunito:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -181,6 +182,9 @@
             <div class="flex gap-2 px-2">
                 <button id="btn-save-journal" class="bg-blue-500 hover:bg-blue-600 text-white font-semibold text-xs py-2.5 px-4 rounded-xl transition-colors">Simpan</button>
                 <button id="btn-edit-journal" class="bg-white hover:bg-sky-50 text-blue-700 border border-sky-200 font-semibold text-xs py-2.5 px-4 rounded-xl transition-colors">Edit</button>
+                <button id="btn-export-data" class="bg-white hover:bg-sky-50 text-blue-700 border border-sky-200 font-semibold text-xs py-2.5 px-4 rounded-xl transition-colors">Export</button>
+                <button id="btn-import-data" class="bg-white hover:bg-sky-50 text-blue-700 border border-sky-200 font-semibold text-xs py-2.5 px-4 rounded-xl transition-colors">Import</button>
+                <input id="import-data-input" type="file" accept="application/json" class="hidden">
             </div>
             <textarea id="journal-input" 
                 class="w-full bg-white/75 border border-sky-200/90 hover:border-sky-300 focus:border-blue-400 focus:bg-white rounded-2xl p-6 text-blue-900 focus:outline-none transition-all placeholder-blue-400/70 font-medium leading-relaxed resize-none h-48 shadow-inner shadow-sky-100/70"
@@ -244,6 +248,17 @@
             "Lo berharga, dengan atau tanpa dia."
         ];
 
+        // --- KONFIGURASI CLOUD SYNC (SUPABASE) ---
+        const CLOUD_SYNC_TABLE = 'atma_terra_journal_sync';
+        const CLOUD_SYNC_ID = 'atma-terra-main';
+        const LOCAL_META_KEY = 'healing_state_meta';
+        const CLOUD_SYNC_INTERVAL_MS = 30000;
+        const supabaseUrl = 'https://cvjzkdzuuuutgbobiwju.supabase.co';
+        const supabaseKey = 'sb_publishable_do3L5iqYASgCW0OowBaj3w__46lHRCX';
+        const supabaseClient = window.supabase?.createClient
+            ? window.supabase.createClient(supabaseUrl, supabaseKey)
+            : null;
+
         // --- ELEMEN DOM ---
         const mainContent = document.getElementById('main-content');
         const mainCounter = document.getElementById('main-counter');
@@ -262,6 +277,9 @@
         const journalModeLabel = document.getElementById('journal-mode-label');
         const btnSaveJournal = document.getElementById('btn-save-journal');
         const btnEditJournal = document.getElementById('btn-edit-journal');
+        const btnExportData = document.getElementById('btn-export-data');
+        const btnImportData = document.getElementById('btn-import-data');
+        const importDataInput = document.getElementById('import-data-input');
         const btnSummaryView = document.getElementById('btn-summary-view');
         const summaryView = document.getElementById('summary-view');
         const btnCloseSummary = document.getElementById('btn-close-summary');
@@ -287,6 +305,7 @@
         let activeJournalDateKey = '';
         let isJournalEditing = true;
         let popupDateKey = '';
+        let cloudSyncBusy = false;
 
         // --- LOGIKA UTAMA ---
 
@@ -448,20 +467,210 @@
             }
         }
 
+        function getLocalMeta() {
+            try {
+                return JSON.parse(localStorage.getItem(LOCAL_META_KEY)) || {};
+            } catch {
+                return {};
+            }
+        }
+
+        function setLocalMeta(meta) {
+            localStorage.setItem(LOCAL_META_KEY, JSON.stringify(meta));
+        }
+
+        function getLocalUpdatedAt() {
+            const meta = getLocalMeta();
+            return meta.updatedAt || new Date(0).toISOString();
+        }
+
+        function markLocalDataChanged() {
+            setLocalMeta({ updatedAt: new Date().toISOString() });
+        }
+
+        function isValidDateKey(value) {
+            return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+        }
+
+        function normalizeImportedEntries(entries) {
+            if (!entries || typeof entries !== 'object') return {};
+
+            const normalized = {};
+            Object.keys(entries).forEach((key) => {
+                if (isValidDateKey(key) && typeof entries[key] === 'string') {
+                    normalized[key] = entries[key];
+                }
+            });
+            return normalized;
+        }
+
         function setJournalEntries(entries) {
             localStorage.setItem(JOURNAL_STORAGE_KEY, JSON.stringify(entries));
         }
 
+        function getCurrentLocalPayload() {
+            return {
+                startDate: localStorage.getItem('healing_start_date') || getStartDate().toISOString(),
+                entries: getJournalEntries(),
+                updatedAt: getLocalUpdatedAt()
+            };
+        }
+
+        function applyCloudPayloadToLocal(payload) {
+            if (!payload || typeof payload !== 'object') return;
+
+            const importedEntries = normalizeImportedEntries(payload.entries);
+            setJournalEntries(importedEntries);
+
+            if (typeof payload.startDate === 'string' && !Number.isNaN(new Date(payload.startDate).getTime())) {
+                localStorage.setItem('healing_start_date', new Date(payload.startDate).toISOString());
+            }
+
+            const safeUpdatedAt =
+                typeof payload.updatedAt === 'string' && !Number.isNaN(new Date(payload.updatedAt).getTime())
+                    ? new Date(payload.updatedAt).toISOString()
+                    : new Date().toISOString();
+            setLocalMeta({ updatedAt: safeUpdatedAt });
+        }
+
+        async function fetchCloudPayload() {
+            if (!supabaseClient) return null;
+
+            const { data, error } = await supabaseClient
+                .from(CLOUD_SYNC_TABLE)
+                .select('payload, updated_at')
+                .eq('sync_id', CLOUD_SYNC_ID)
+                .maybeSingle();
+
+            if (error) {
+                throw error;
+            }
+
+            if (!data || !data.payload) return null;
+            return data.payload;
+        }
+
+        async function pushCloudPayload(payload) {
+            if (!supabaseClient) return;
+
+            const { error } = await supabaseClient
+                .from(CLOUD_SYNC_TABLE)
+                .upsert(
+                    {
+                        sync_id: CLOUD_SYNC_ID,
+                        payload,
+                        updated_at: payload.updatedAt || new Date().toISOString()
+                    },
+                    { onConflict: 'sync_id' }
+                );
+
+            if (error) {
+                throw error;
+            }
+        }
+
+        async function runCloudSync() {
+            if (!supabaseClient || cloudSyncBusy) return;
+
+            cloudSyncBusy = true;
+            try {
+                const localPayload = getCurrentLocalPayload();
+                const cloudPayload = await fetchCloudPayload();
+
+                if (!cloudPayload) {
+                    await pushCloudPayload(localPayload);
+                    return;
+                }
+
+                const localTime = new Date(localPayload.updatedAt || 0).getTime();
+                const cloudTime = new Date(cloudPayload.updatedAt || 0).getTime();
+
+                if (cloudTime > localTime) {
+                    applyCloudPayloadToLocal(cloudPayload);
+                    renderJournalMenu();
+                    loadJournalByDate(getLocalDateKey());
+                    updateUI();
+                    if (!summaryView.classList.contains('hidden')) {
+                        renderSummaryPage();
+                    }
+                } else if (localTime > cloudTime) {
+                    await pushCloudPayload(localPayload);
+                }
+            } catch (error) {
+                console.warn('Cloud sync error:', error.message || error);
+            } finally {
+                cloudSyncBusy = false;
+            }
+        }
+
+        function exportJournalData() {
+            const payload = {
+                version: 1,
+                exportedAt: new Date().toISOString(),
+                startDate: localStorage.getItem('healing_start_date') || getStartDate().toISOString(),
+                entries: getJournalEntries()
+            };
+
+            const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            const dateKey = getLocalDateKey();
+            link.href = url;
+            link.download = `atma-terra-backup-${dateKey}.json`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+        }
+
+        async function importJournalData(file) {
+            const text = await file.text();
+            const parsed = JSON.parse(text);
+
+            if (!parsed || typeof parsed !== 'object') {
+                throw new Error('Format file tidak valid.');
+            }
+
+            const normalizedEntries = normalizeImportedEntries(parsed.entries);
+            const entryCount = Object.keys(normalizedEntries).length;
+
+            if (entryCount === 0) {
+                throw new Error('Tidak ada data jurnal valid di file.');
+            }
+
+            setJournalEntries(normalizedEntries);
+
+            const importedStartDate = parsed.startDate;
+            if (typeof importedStartDate === 'string' && !Number.isNaN(new Date(importedStartDate).getTime())) {
+                localStorage.setItem('healing_start_date', new Date(importedStartDate).toISOString());
+            }
+
+            markLocalDataChanged();
+
+            renderJournalMenu();
+            loadJournalByDate(getLocalDateKey());
+            updateUI();
+            if (!summaryView.classList.contains('hidden')) {
+                renderSummaryPage();
+            }
+
+            alert(`Import berhasil. ${entryCount} jurnal dimuat.`);
+
+            await runCloudSync();
+        }
+
         function migrateLegacyJournal() {
             const legacyValue = localStorage.getItem('healing_journal');
-            if (!legacyValue) return;
+            if (!legacyValue) return false;
 
             const entries = getJournalEntries();
             if (Object.keys(entries).length === 0) {
                 entries[getLocalDateKey()] = legacyValue;
                 setJournalEntries(entries);
+                markLocalDataChanged();
             }
             localStorage.removeItem('healing_journal');
+            return true;
         }
 
         function renderJournalMenu() {
@@ -572,6 +781,7 @@
             const entries = getJournalEntries();
             entries[activeJournalDateKey] = journalInput.value;
             setJournalEntries(entries);
+            markLocalDataChanged();
             renderJournalMenu();
             if (!summaryView.classList.contains('hidden')) {
                 renderSummaryPage();
@@ -580,12 +790,34 @@
             setJournalEditing(false);
 
             setTimeout(() => { saveStatus.style.opacity = '0'; }, 2000);
+
+            runCloudSync();
         });
 
         btnEditJournal.addEventListener('click', () => {
             setJournalEditing(true);
             journalInput.focus();
             saveStatus.style.opacity = '0';
+        });
+
+        btnExportData.addEventListener('click', () => {
+            exportJournalData();
+        });
+
+        btnImportData.addEventListener('click', () => {
+            importDataInput.value = '';
+            importDataInput.click();
+        });
+
+        importDataInput.addEventListener('change', async (event) => {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+
+            try {
+                await importJournalData(file);
+            } catch (error) {
+                alert(`Import gagal: ${error.message}`);
+            }
         });
 
         journalDatePicker.addEventListener('change', (event) => {
@@ -666,11 +898,14 @@
         btnSaveDate.addEventListener('click', () => {
             if (dateInput.value) {
                 localStorage.setItem('healing_start_date', new Date(dateInput.value).toISOString());
+                markLocalDataChanged();
                 datePickerContainer.classList.add('hidden');
                 updateUI(); // Refresh tampilan
                 if (!summaryView.classList.contains('hidden')) {
                     renderSummaryPage();
                 }
+
+                runCloudSync();
             }
         });
 
@@ -689,6 +924,9 @@
             setTimeout(() => {
                 mainContent.classList.remove('opacity-0');
             }, 100);
+
+            runCloudSync();
+            setInterval(runCloudSync, CLOUD_SYNC_INTERVAL_MS);
         };
 
     </script>
